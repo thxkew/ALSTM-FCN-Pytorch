@@ -2,98 +2,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class Attention(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(Attention, self).__init__()
-        self.W_query = nn.Linear(hidden_size, hidden_size)
-        self.W_key = nn.Linear(input_size, hidden_size)
-        self.V = nn.Linear(hidden_size, 1)
+class BahdanauAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super(BahdanauAttention, self).__init__()
+        self.W_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.V = nn.Linear(hidden_size, 1, bias=False)
 
-    def forward(self, x_t, h_prev):
-        """
-        Input:  x_t has dimensions [B, C]
-                h_prev has dimentions [B, H]
+    def forward(self, query, keys):
+        # query: [seq_len, batch_size, hidden_size]
+        # keys: [seq_len, batch_size, hidden_size]
 
-        Output: context has dimensions [B, 1]
+        query = query.unsqueeze(0)  # [1, batch_size, hidden_size]
 
-        Where B: batch size, C: number of channel, H: hidden size
-        """
+        energy = torch.tanh(self.W_q(query) + self.W_k(keys))  # [seq_len, batch_size, hidden_size]
 
-        query = self.W_query(h_prev)
-        keys = self.W_key(x_t)
+        attention_scores = self.V(energy).squeeze(-1)  # [seq_len, batch_size]
+        attention_weights = torch.softmax(attention_scores, dim=0)  # [seq_len, batch_size]
 
-        # Batch matrix multiplication
-        energy = self.V(torch.tanh(query + keys))
-        attention_weights = F.softmax(energy, dim=1)
+        # Expand dimensions of attention_weights for broadcasting
+        attention_weights_expanded = attention_weights.unsqueeze(2)  # shape: [seq_length, batch_size, 1]
 
-        context = torch.sum(x_t * attention_weights, dim=1).unsqueeze(-1)
-        
-        return context
+        # Multiply attention weights with keys to get weighted sum
+        context_vector = torch.sum(keys * attention_weights_expanded, dim=0)  # shape: [batch_size, 256]
 
-class AttentionLSTMCell(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(AttentionLSTMCell, self).__init__()
-
-        self.lstm_cell = torch.nn.LSTMCell(input_size+1, hidden_size)
-        self.attention = Attention(input_size, hidden_size)
-
-    def forward(self, x_t, h_prev, c_prev):
-        """
-        Input:  x_t has dimensions [B, C]
-                h_prev has dimensions [B, H]
-                c_prev has dimensions [B, H]
-
-        Output: h_t has dimensions [B, H]
-                c_t has dimensions [B, H]
-
-        Where B: batch size, C: number of channel, H: hidden size
-        """
-
-        context = self.attention(x_t, h_prev)
-
-        lstm_input = torch.cat((x_t, context), dim=1)
-        h_t, c_t = self.lstm_cell(lstm_input, (h_prev, c_prev))
-
-        return h_t, c_t
-
-
-class AttentionLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(AttentionLSTM, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-
-        self.cell = AttentionLSTMCell(self.input_size, self.hidden_size)
-
-    def forward(self, x, init_states=None):
-        """
-        Input : x has dimensions [L, B, C]
-        
-        Output: h_t has dimensions [B, H]
-                c_t has dimensions [B, H]
-        
-        (L: sequence lenght, B: batch size, C: number of channel) 
-        """
-
-        L, B, _ = x.size()
-
-        h_t, c_t = (torch.zeros(B, self.hidden_size).to(x.device),
-                    torch.zeros(B, self.hidden_size).to(x.device)) if init_states is None else init_states
-
-        for i in range(L):
-
-            h_t, c_t = self.cell(x[i], h_t, c_t)
-
-        return h_t, c_t
+        return context_vector, attention_weights
 
 class ALSTM_FCN(nn.Module):
-    def __init__(self, input_size, num_classes, momentum=0.99, eps=0.001):
+    def __init__(self, input_size, lstm_input_size, num_classes, momentum=0.99, eps=0.001):
         super(ALSTM_FCN, self).__init__()
-        
-        self.avg = nn.AdaptiveAvgPool1d(240)
-        
-        self.alstm = AttentionLSTM(input_size=240, hidden_size=8)
+
+        self.lstm = nn.LSTM(lstm_input_size, 8)
         self.lstm_dropout = nn.Dropout(p=0.8)
+
+        self.attention = BahdanauAttention(128)
         
         self.feature = nn.Sequential(   
 
@@ -130,9 +72,9 @@ class ALSTM_FCN(nn.Module):
         x_lstm = x.clone().permute(1, 0, 2)
 
         #LSTM branch
-        h, c = self.alstm(x_lstm)
-        x_lstm = self.lstm_dropout(h)
-        x_lstm = torch.squeeze(x_lstm, dim=0)
+        outputs, (h, c) = self.lstm(x_lstm)
+        context, attention_weights = self.attention(h[-1], outputs)
+        x_lstm = self.lstm_dropout(context)
 
         x = torch.cat((x_lstm, x_fcn),dim=1)
         x = self.fc(x)
